@@ -1,251 +1,284 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+import sqlite3
 from datetime import datetime, timedelta
 from langchain_groq import ChatGroq
 import os
 
-# Page configuration
-st.set_page_config(
-    page_title="Deloitte Employee Well-being Bot",
-    page_icon="📊",
-    layout="wide"
-)
+# ----------------------------
+# 1. Database Setup
+# ----------------------------
 
-# Initialize session state
-if 'selected_employees' not in st.session_state:
-    st.session_state.selected_employees = []
-if 'chat_history' not in st.session_state:
-    st.session_state.chat_history = {}
-if 'datasets_loaded' not in st.session_state:
-    st.session_state.datasets_loaded = False
-if 'reports' not in st.session_state:
-    st.session_state.reports = {}
-if 'groq_api_key' not in st.session_state:
-    st.session_state.groq_api_key = ""
+def init_db():
+    conn = sqlite3.connect('employee_data.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS employees (
+        Employee_ID TEXT PRIMARY KEY,
+        Vibe_Score INTEGER,
+        Work_Hours REAL,
+        Days_Since_Leave INTEGER,
+        Last_Conversation TEXT,
+        Status TEXT
+    )''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS conversations (
+        Conversation_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+        Employee_ID TEXT,
+        Message TEXT,
+        Response TEXT,
+        Timestamp TEXT
+    )''')
+    
+    conn.commit()
+    conn.close()
 
-# Data loading functions
-def load_sample_data():
-    """Generate sample datasets for demonstration"""
-    # Sample Vibemeter dataset
-    vibemeter_data = pd.DataFrame({
-        'Employee_ID': [f'EMP{i:04d}' for i in range(1, 501)],
-        'Response_Date': [datetime.now().date() - timedelta(days=i) for i in range(500)],
-        'Vibe_Score': np.random.randint(1, 6, 500)
-    })
-    
-    # Sample Leave dataset
-    leave_data = pd.DataFrame({
-        'Employee_ID': [f'EMP{i:04d}' for i in range(1, 501)],
-        'Leave_Start_Date': [datetime.now().date() - timedelta(days=30 + i) for i in range(500)],
-        'Leave_End_Date': [datetime.now().date() - timedelta(days=25 + i) for i in range(500)]
-    })
-    
-    # Sample Activity Tracker dataset
-    activity_data = pd.DataFrame({
-        'Employee_ID': [f'EMP{i:04d}' for i in range(1, 501)],
-        'Date': [datetime.now().date() - timedelta(days=i) for i in range(500)],
-        'Work_Hours': np.random.randint(6, 12, 500)
-    })
-    
-    return vibemeter_data, leave_data, activity_data
+# ----------------------------
+# 2. Data Processing
+# ----------------------------
 
-# Employee selection logic
-def select_employees(vibemeter_df, leave_df, activity_df):
-    """Select employees based on well-being criteria"""
+def process_uploaded_file(file, date_columns=[]):
+    """Handle CSV uploads with date parsing"""
+    try:
+        df = pd.read_csv(file)
+        for col in date_columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+        return df
+    except Exception as e:
+        st.error(f"Error processing file: {str(e)}")
+        return None
+
+def calculate_metrics(leave_df):
+    """Safe date difference calculation"""
     today = datetime.now().date()
+    leave_df = leave_df.copy()
     
-    # Calculate metrics
-    leave_df['Days_Since_Leave'] = (today - leave_df['Leave_End_Date']).dt.days
-    activity_agg = activity_df.groupby('Employee_ID')['Work_Hours'].mean().reset_index()
-    
-    # Merge datasets
-    merged_df = vibemeter_df.merge(leave_df, on='Employee_ID').merge(activity_agg, on='Employee_ID')
-    
-    # Apply selection criteria
-    selected = merged_df[
-        (merged_df['Vibe_Score'] <= 2) | 
-        (merged_df['Work_Hours'] > 9) |
-        (merged_df['Days_Since_Leave'] > 30)
-    ]
-    
-    return selected[['Employee_ID', 'Vibe_Score', 'Work_Hours', 'Days_Since_Leave']]
+    if 'Leave_End_Date' in leave_df.columns:
+        leave_df['Days_Since_Leave'] = leave_df['Leave_End_Date'].apply(
+            lambda x: (today - x.date()).days 
+            if pd.notnull(x) else 999
+        )
+    return leave_df
 
-# Groq LLM integration
-def generate_response(employee_id, message, employee_data):
-    """Generate empathetic response using Groq"""
-    if not st.session_state.groq_api_key:
-        return "Please configure Groq API key in Settings"
+# ----------------------------
+# 3. Employee Selection Logic
+# ----------------------------
+
+def select_employees(vibemeter, leave, activity):
+    """Enhanced selection with data validation"""
+    try:
+        # Merge datasets
+        merged = (
+            vibemeter.merge(leave, on='Employee_ID', how='left')
+            .merge(activity, on='Employee_ID', how='left')
+        )
+        
+        # Apply selection criteria
+        selected = merged[
+            (merged['Vibe_Score'] <= 2) |
+            (merged['Work_Hours'] > 9) |
+            (merged['Days_Since_Leave'] > 30)
+        ]
+        
+        return selected[['Employee_ID', 'Vibe_Score', 'Work_Hours', 'Days_Since_Leave']]
+    
+    except KeyError as e:
+        st.error(f"Missing required column: {str(e)}")
+        return pd.DataFrame()
+
+# ----------------------------
+# 4. Groq Integration
+# ----------------------------
+
+def get_groq_response(employee_data, message):
+    """Generate context-aware responses"""
+    if not st.session_state.get('groq_api_key'):
+        return "API key not configured"
     
     try:
-        groq_llm = ChatGroq(
+        llm = ChatGroq(
             temperature=0.7,
             model_name="mixtral-8x7b-32768",
             api_key=st.session_state.groq_api_key
         )
         
-        system_prompt = f"""You are an empathetic HR assistant. Employee context:
-        - Vibe Score: {employee_data['Vibe_Score']}
-        - Avg Work Hours: {employee_data['Work_Hours']}
-        - Days Since Last Leave: {employee_data['Days_Since_Leave']}"""
+        system_prompt = f"""
+        Employee Context:
+        - Vibe Score: {employee_data.get('Vibe_Score', 'N/A')}
+        - Avg Hours: {employee_data.get('Work_Hours', 'N/A')}
+        - Days Since Leave: {employee_data.get('Days_Since_Leave', 'N/A')}
+        """
         
-        response = groq_llm.chat(messages=[
+        return llm.chat([
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": message}
-        ])
+        ]).content
         
-        return response.content
     except Exception as e:
-        return f"Error generating response: {str(e)}"
+        return f"Error: {str(e)}"
 
-# Sidebar navigation
-st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", [
-    "Home", 
-    "Employee Selection", 
-    "Data Analysis", 
-    "Employee Interaction",
-    "Reports & Insights",
-    "Settings"
-])
+# ----------------------------
+# 5. Streamlit Application
+# ----------------------------
 
-# Main content
-if page == "Home":
-    st.title("Deloitte Employee Well-being Bot")
-    st.write("Automated employee well-being tracking and engagement system")
+st.set_page_config(
+    page_title="Deloitte Well-being Bot",
+    page_icon="🤖",
+    layout="wide"
+)
+
+init_db()
+if 'selected_employees' not in st.session_state:
+    st.session_state.selected_employees = pd.DataFrame()
+
+# Sidebar Navigation
+pages = {
+    "Data Upload": "📥",
+    "Employee Selection": "👥",
+    "Conversations": "💬", 
+    "Analytics": "📊",
+    "Settings": "⚙️"
+}
+
+page = st.sidebar.radio("Navigation", list(pages.keys()), format_func=lambda x: f"{pages[x]} {x}")
+
+# ----------------------------
+# Page: Data Upload
+# ----------------------------
+if page == "Data Upload":
+    st.title("Data Management")
     
-    col1, col2 = st.columns(2)
-    with col1:
-        st.write("""
-        ### Key Features:
-        - Automated employee selection
-        - AI-powered conversations
-        - Real-time analytics
-        - HR escalation system
-        - Daily reporting
-        """)
-        
-    with col2:
-        if st.button("Load Sample Data"):
-            vibemeter, leave, activity = load_sample_data()
-            st.session_state.vibemeter = vibemeter
-            st.session_state.leave = leave
-            st.session_state.activity = activity
-            st.session_state.datasets_loaded = True
-            st.success("Sample data loaded!")
-            
-            # Run initial selection
+    with st.expander("Upload Vibemeter Data"):
+        vibe_file = st.file_uploader("Vibemeter CSV", type=['csv'], key='vibe')
+        if vibe_file:
+            st.session_state.vibemeter = process_uploaded_file(
+                vibe_file, ['Response_Date']
+            )
+    
+    with st.expander("Upload Leave Data"):
+        leave_file = st.file_uploader("Leave CSV", type=['csv'], key='leave')
+        if leave_file:
+            st.session_state.leave = calculate_metrics(
+                process_uploaded_file(leave_file, ['Leave_Start_Date', 'Leave_End_Date'])
+            )
+    
+    with st.expander("Upload Activity Data"):
+        activity_file = st.file_uploader("Activity CSV", type=['csv'], key='activity')
+        if activity_file:
+            st.session_state.activity = process_uploaded_file(activity_file, ['Date'])
+
+# ----------------------------
+# Page: Employee Selection  
+# ----------------------------
+elif page == "Employee Selection":
+    st.title("Employee Selection Engine")
+    
+    if st.button("Run Selection Algorithm"):
+        required_data = ['vibemeter', 'leave', 'activity']
+        if all([d in st.session_state for d in required_data]):
             st.session_state.selected_employees = select_employees(
                 st.session_state.vibemeter,
                 st.session_state.leave,
                 st.session_state.activity
             )
-
-elif page == "Employee Selection":
-    st.title("Employee Selection")
-    
-    if not st.session_state.datasets_loaded:
-        st.warning("Load data first from Home page")
-    else:
-        st.write("### Selected Employees for Engagement")
-        st.dataframe(st.session_state.selected_employees)
-        
-        st.write("### Selection Criteria")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Total Employees", 500)
-            st.metric("Negative Vibe Threshold", "Score ≤ 2")
-        with col2:
-            st.metric("Work Hour Threshold", ">9 hours/day")
-            st.metric("Leave Threshold", ">30 days since last")
-
-elif page == "Data Analysis":
-    st.title("Data Analysis")
-    
-    if not st.session_state.datasets_loaded:
-        st.warning("Load data first from Home page")
-    else:
-        st.write("### Vibe Distribution")
-        fig, ax = plt.subplots()
-        sns.histplot(st.session_state.vibemeter['Vibe_Score'], bins=5, kde=True)
-        st.pyplot(fig)
-        
-        st.write("### Workload vs Vibe Correlation")
-        corr_data = st.session_state.vibemeter.merge(
-            st.session_state.activity.groupby('Employee_ID')['Work_Hours'].mean().reset_index(),
-            on='Employee_ID'
-        )
-        fig, ax = plt.subplots()
-        sns.scatterplot(x='Work_Hours', y='Vibe_Score', data=corr_data)
-        st.pyplot(fig)
-
-elif page == "Employee Interaction":
-    st.title("Employee Interaction")
+            st.success(f"Selected {len(st.session_state.selected_employees)} employees")
+        else:
+            st.error("Missing required datasets")
     
     if not st.session_state.selected_employees.empty:
-        employee = st.selectbox("Select Employee", st.session_state.selected_employees['Employee_ID'])
-        
-        # Initialize chat history
-        if employee not in st.session_state.chat_history:
-            st.session_state.chat_history[employee] = []
-            
-        # Display chat history
-        st.write("### Conversation History")
-        for msg in st.session_state.chat_history[employee]:
-            st.markdown(f"**{msg['role']}**: {msg['content']}")
-            
-        # Input and send message
-        message = st.text_input("Enter your message")
-        if st.button("Send"):
-            employee_data = st.session_state.selected_employees[
-                st.session_state.selected_employees['Employee_ID'] == employee
-            ].iloc[0].to_dict()
-            
-            response = generate_response(employee, message, employee_data)
-            
-            st.session_state.chat_history[employee].append({
-                "role": "User",
-                "content": message
-            })
-            st.session_state.chat_history[employee].append({
-                "role": "Bot",
-                "content": response
-            })
-            st.experimental_rerun()
-    else:
-        st.warning("No employees selected. Run selection first.")
+        st.dataframe(st.session_state.selected_employees, use_container_width=True)
 
-elif page == "Reports & Insights":
-    st.title("Daily Reports")
+# ----------------------------
+# Page: Conversations
+# ----------------------------
+elif page == "Conversations":
+    st.title("Employee Interactions")
     
-    if not st.session_state.datasets_loaded:
-        st.warning("Load data first from Home page")
-    else:
-        st.write("### Key Metrics")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Employees Selected", len(st.session_state.selected_employees))
-        col2.metric("Avg Vibe Score", round(st.session_state.selected_employees['Vibe_Score'].mean(), 1))
-        col3.metric("Avg Work Hours", round(st.session_state.selected_employees['Work_Hours'].mean(), 1))
+    if not st.session_state.selected_employees.empty:
+        emp = st.selectbox("Select Employee", st.session_state.selected_employees['Employee_ID'])
+        emp_data = st.session_state.selected_employees[
+            st.session_state.selected_employees['Employee_ID'] == emp
+        ].iloc[0].to_dict()
         
-        st.write("### Recommended Actions")
-        st.write("1. Schedule team-building activities for Department A")
-        st.write("2. Review workload distribution in Department B")
-        st.write("3. Conduct recognition workshops for Department C")
+        # Conversation History
+        conn = sqlite3.connect('employee_data.db')
+        history = pd.read_sql(
+            f"SELECT * FROM conversations WHERE Employee_ID = '{emp}'",
+            conn
+        )
+        
+        # Display History
+        for _, row in history.iterrows():
+            st.chat_message("user").write(row['Message'])
+            st.chat_message("assistant").write(row['Response'])
+        
+        # New Message
+        if prompt := st.chat_input("Type your message"):
+            response = get_groq_response(emp_data, prompt)
+            
+            # Store conversation
+            conn.execute('''
+                INSERT INTO conversations 
+                (Employee_ID, Message, Response, Timestamp)
+                VALUES (?,?,?,?)
+            ''', (emp, prompt, response, datetime.now().isoformat()))
+            
+            # Update employee status
+            conn.execute('''
+                UPDATE employees SET
+                Last_Conversation = ?,
+                Status = ?
+                WHERE Employee_ID = ?
+            ''', (datetime.now().isoformat(), "Engaged", emp))
+            
+            conn.commit()
+            conn.close()
+            st.rerun()
 
+# ----------------------------
+# Page: Analytics
+# ----------------------------
+elif page == "Analytics":
+    st.title("Employee Well-being Analytics")
+    
+    conn = sqlite3.connect('employee_data.db')
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Vibe Score Distribution")
+        vibe_dist = pd.read_sql("SELECT Vibe_Score, COUNT(*) FROM employees GROUP BY Vibe_Score", conn)
+        st.bar_chart(vibe_dist.set_index('Vibe_Score'))
+    
+    with col2:
+        st.subheader("Work Hours Analysis")
+        hours_data = pd.read_sql("SELECT Work_Hours FROM employees", conn)
+        st.line_chart(hours_data)
+    
+    st.subheader("Recent Conversations")
+    convos = pd.read_sql("SELECT * FROM conversations ORDER BY Timestamp DESC LIMIT 10", conn)
+    st.dataframe(convos)
+
+# ----------------------------
+# Page: Settings
+# ----------------------------
 elif page == "Settings":
-    st.title("System Settings")
+    st.title("System Configuration")
     
-    st.write("### Groq API Configuration")
+    st.subheader("Groq API Settings")
     api_key = st.text_input("Enter Groq API Key", type="password")
     if api_key:
         st.session_state.groq_api_key = api_key
-        st.success("API key configured!")
+        st.success("API key configured")
     
-    st.write("### Model Settings")
-    model_name = st.selectbox("Select LLM Model", ["mixtral-8x7b-32768", "llama3-70b-8192"])
-    temperature = st.slider("Response Creativity", 0.0, 1.0, 0.7)
-    
+    st.subheader("Model Settings")
+    model_name = st.selectbox("LLM Model", ["mixtral-8x7b-32768", "llama2-70b-4096"])
+    temperature = st.slider("Creativity", 0.0, 1.0, 0.7)
+
+# ----------------------------
+# Initialization
+# ----------------------------
 if __name__ == "__main__":
-    st.write("Deloitte Employee Well-being Bot - v1.0")
+    st.write("Deloitte Employee Well-being Bot v2.0")
